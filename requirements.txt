@@ -1,1 +1,6 @@
 streamlit
+requests
+openai>=1.0.0
+google-api-python-client
+mysql-connector-python
+pydantic
