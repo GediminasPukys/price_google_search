@@ -222,7 +222,7 @@ def analyze_product_url(url, search_parameters, openai_api_key):
 
     # Construct the prompt with the formatted parameters
     prompt = f"""
-        Analyze the given webpage URL for {category} {subcategory} {product_type} and gather detailed product information according to the following:
+        Analyze the given webpage URL={url} for {category} {subcategory} {product_type} and gather detailed product information according to the following:
                      product type: {specification_name}
                      product specification:
     {tech_spec}
@@ -257,6 +257,7 @@ def analyze_product_url(url, search_parameters, openai_api_key):
         response = client.responses.parse(
             model="gpt-4.1",
             tools=[{
+                # "type": 'asdf',
                 "type": "web_search_preview",
                 "user_location": {
                     "type": "approximate",
@@ -836,7 +837,6 @@ def display_search_results(search_results, search_parameters, openai_api_key=Non
                                 with st.spinner(f"Analyzing price for product {i + 1}..."):
                                     price_analysis = analyze_product_url(result['url'], search_parameters,
                                                                          openai_api_key)
-                                    st.write(price_analysis)
                                     if price_analysis:
                                         price_analyses[result['url']] = price_analysis
                             except Exception as e:
@@ -844,23 +844,48 @@ def display_search_results(search_results, search_parameters, openai_api_key=Non
 
                         # Display price analysis if available
                         if result['url'] in price_analyses:
-                            analysis = price_analyses[result['url']]
-                            st.write("### Price Analysis")
-                            st.write(f"**Product:** {analysis.product_name}")
+                            analysis_list = price_analyses[result['url']]
+                            if analysis_list and len(analysis_list) > 0:  # Check if the list is not empty
+                                # Take the first product from the list
+                                analysis = analysis_list[0]
+                                st.write("### Price Analysis")
+                                st.write(f"**Product:** {analysis['product_name']}")
 
-                            # Price information
-                            if analysis.regular_price:
-                                st.write(f"**Regular Price:** €{analysis.regular_price:.2f}")
-                            if analysis.sale_price:
-                                st.write(f"**Sale Price:** €{analysis.sale_price:.2f}")
-                            if analysis.price_per_unit and analysis.unit_type:
-                                st.write(f"**Price per {analysis.unit_type}:** €{analysis.price_per_unit:.2f}")
+                                # Price information
+                                if 'product_price' in analysis:
+                                    st.write(f"**Price:** {analysis['product_price']}")
+                                if 'price_per_' in analysis and analysis['price_per_']:
+                                    st.write(f"**Price per:** {analysis['price_per_']}")
 
-                            # Availability
-                            st.write(f"**Availability:** {analysis.availability}")
+                                # Display product properties
+                                if 'product_properties' in analysis and analysis['product_properties']:
+                                    st.write("**Properties:**")
+                                    st.text(analysis['product_properties'])
 
-                            # Display price judgment with appropriate styling
-                            st.markdown(f"**Price Assessment:** {analysis.price_judgment}")
+                                # Display evaluation/judgment
+                                if 'evaluation' in analysis:
+                                    st.markdown(f"**Evaluation:** {analysis['evaluation']}")
+
+                                # Display provider information
+                                if 'provider' in analysis:
+                                    st.write(f"**Provider:** {analysis['provider']} ({analysis['provider_website']})")
+
+                                # Display more products if available
+                                if len(analysis_list) > 1:
+                                    show_more = st.checkbox(f"View {len(analysis_list) - 1} more similar products",
+                                                            key=f"more_products_{i}")
+                                    if show_more:
+                                        for j, product in enumerate(analysis_list[1:], 1):
+                                            st.write(f"**Alternative {j}: {product.get('product_name', 'N/A')}**")
+                                            st.write(f"**Price:** {product.get('product_price', 'N/A')}")
+                                            if 'product_properties' in product and product['product_properties']:
+                                                st.write("**Properties:**")
+                                                st.text(product['product_properties'])
+                                            if 'evaluation' in product:
+                                                st.write(f"**Evaluation:** {product['evaluation']}")
+                                            st.write(
+                                                f"**Provider:** {product.get('provider', 'N/A')} ({product.get('provider_website', 'N/A')})")
+                                            st.divider()
 
         # Clear progress indicators once done
         if openai_api_key:
@@ -876,14 +901,13 @@ def display_search_results(search_results, search_parameters, openai_api_key=Non
                 for result in search_results['results']:
                     result_data = result.copy()
                     if result['url'] in price_analyses:
-                        result_data['price_analysis'] = price_analyses[result['url']].model_dump()
+                        result_data['price_analysis'] = price_analyses[result['url']]
                     export_data.append(result_data)
                 st.json(export_data)
             else:
                 st.json(search_results['results'])
     else:
         st.warning("No results found. Try modifying your search terms.")
-
 
 if __name__ == "__main__":
     main()
