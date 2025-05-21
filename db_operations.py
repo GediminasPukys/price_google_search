@@ -117,7 +117,7 @@ def get_specification_parameters(spec_id):
           UNION ALL
           SELECT 'tipas', tipas
           FROM result_set),
-     cte_produktai AS (SELECT p.name AS 'parametras', p.description AS 'reikalavimas parametrui'
+     cte_produktai AS (SELECT p.name AS 'parametras', p.description AS reikalavimas_parametrui
                        FROM jos_catalog_params p
                        WHERE p.class_id = {spec_id}
                          AND p.type != 'hidden_param'
@@ -125,7 +125,7 @@ def get_specification_parameters(spec_id):
 SELECT `key` AS parametras, value AS 'reikalavimas parametrui'
 FROM cte_vaistai
 UNION ALL
-SELECT parametras, 'reikalavimas parametrui'
+SELECT parametras, reikalavimas_parametrui as 'reikalavimas parametrui'
 FROM cte_produktai;
             """
             

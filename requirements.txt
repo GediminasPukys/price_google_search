@@ -4,3 +4,8 @@ openai>=1.0.0
 google-api-python-client
 mysql-connector-python
 pydantic
+bs4
+selenium
+webdriver_manager
+google-generativeai
+google.genai

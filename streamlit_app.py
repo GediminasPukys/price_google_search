@@ -256,15 +256,14 @@ def analyze_product_url(url, search_parameters, openai_api_key):
     try:
         response = client.responses.parse(
             model="gpt-4.1",
-            tools=[{
-                # "type": 'asdf',
-                "type": "web_search_preview",
-                "user_location": {
-                    "type": "approximate",
-                    "country": "LT",
-                    "city": "Vilnius",
-                }
-            }],
+            # tools=[{
+            #     "type": "web_search_preview",
+            #     "user_location": {
+            #         "type": "approximate",
+            #         "country": "LT",
+            #         "city": "Vilnius",
+            #     }
+            # }],
             temperature=0.2,
             input=prompt,
             text_format=ProductList,
@@ -357,7 +356,7 @@ def main():
     st.markdown("Find and analyze product prices in the Lithuanian market")
 
     # Set demo mode once at the beginning
-    demo_mode = st.sidebar.checkbox("Demo Mode (No MySQL)", value=True, key="demo_mode_checkbox")
+    demo_mode = st.sidebar.checkbox("Demo Mode (No MySQL)", value=False, key="demo_mode_checkbox")
 
     # Check for API keys in secrets
     missing_keys = []
@@ -835,6 +834,7 @@ def display_search_results(search_results, search_parameters, openai_api_key=Non
                         if result['url'] not in price_analyses:
                             try:
                                 with st.spinner(f"Analyzing price for product {i + 1}..."):
+                                    st.write(result['url'])
                                     price_analysis = analyze_product_url(result['url'], search_parameters,
                                                                          openai_api_key)
                                     if price_analysis:
