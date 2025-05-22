@@ -80,7 +80,7 @@ def get_prompt(category, subcategory, product_type, specification_name, tech_spe
     Content: {scrape_result}
 
     Next steps:
-    1. Find all products in the content and gather detailed product information
+    1. Find all products in the content and gather detailed product information (this means return as many products as possible).
     2. Judge whether products meet the provided specifications:
        - Category: {category} {subcategory} {product_type} 
        - Product type: {specification_name}
@@ -862,7 +862,7 @@ def main():
                 if "num_results" not in st.session_state:
                     st.session_state.num_results = 10
 
-                num_results = st.slider("Number of results", 5, 30, 10, key="num_results")
+                num_results = st.slider("Number of results", 1, 10, 10, key="num_results")
 
                 # Search interface
                 col1, col2 = st.columns([1, 3])
