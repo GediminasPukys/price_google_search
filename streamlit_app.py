@@ -6,6 +6,7 @@ import pandas as pd
 import re
 import json
 from typing import List, Dict, Optional, Union, Any
+from firecrawl import FirecrawlApp
 
 # Import database operations
 from db_operations import (
@@ -32,23 +33,198 @@ class ProductList(BaseModel):
     products: list[ProductPrice]
 
 
+class ProductUrl(BaseModel):
+    product_name: str
+    product_url: str
+
+
+class ProductUrlList(BaseModel):
+    products: list[ProductUrl]
+
+
+class PageJudge(BaseModel):
+    is_aggregator: bool
+
+
 class SearchPhrase(BaseModel):
     """Model for structured search phrase output from OpenAI."""
     search_phrase: str = Field(description="Optimized search phrase for finding products")
     keywords: list[str] = Field(description="Individual keywords extracted from specifications")
 
 
-class ProductPrice(BaseModel):
-    """Model for structured product price analysis output from OpenAI."""
-    product_name: str = Field(description="Complete name of the product")
-    regular_price: Optional[float] = Field(None, description="Regular/Current price in EUR")
-    sale_price: Optional[float] = Field(None, description="Sale price if available in EUR")
-    price_per_unit: Optional[float] = Field(None, description="Price per unit if applicable")
-    unit_type: Optional[str] = Field(None, description="Unit type (kg, liter, piece, etc.)")
-    availability: str = Field(description="Product availability status (in stock, out of stock, etc.)")
-    price_judgment: str = Field(description="Assessment of price competitiveness in the market")
-    provider: str = Field(description="Name of the store/website selling the product")
-    last_updated: Optional[str] = Field(None, description="When the price was last updated if available")
+def is_aggregator(client, scrape_result):
+    """Determine if a webpage is a price aggregator or direct product listing."""
+    prompt = f"""Does this content appear to be from a product price aggregator website (e.g., a site that lists links to products from other retailers or websites, such as a price comparison site), or is it a direct product listing page (e.g., an online store page where products are listed with their own descriptions and prices)?
+
+    Return true if it's an aggregator with links to actual products.
+    Return false if it's a product listing page or landing page.
+
+    Content: {scrape_result}
+    """
+
+    response = client.responses.parse(
+        model="gpt-4o",
+        input=prompt,
+        text_format=PageJudge,
+    )
+    return response.output_parsed.is_aggregator
+
+
+def get_urls(client, category, subcategory, product_type, specification_name, scrape_result):
+    """Extract product URLs from aggregator pages."""
+    prompt = f"""In the given content of a price aggregator website, find relevant products and their corresponding URLs.
+
+    Relevant products should match: category: {category} {subcategory} {product_type} and product type: {specification_name}
+
+    Content: {scrape_result}
+    """
+
+    response = client.responses.parse(
+        model="gpt-4o",
+        input=prompt,
+        text_format=ProductUrlList,
+    )
+
+    parsed_product_urls = []
+    for product in response.output_parsed.products:
+        parsed_product_urls.append(product.model_dump())
+    return parsed_product_urls
+
+
+def get_prompt(category, subcategory, product_type, specification_name, tech_spec, scrape_result):
+    """Generate analysis prompt for product webpage content."""
+    prompt = f"""
+    Analyze the given product webpage content:
+    Content: {scrape_result}
+
+    Next steps:
+    1. Find all products in the content and gather detailed product information
+    2. Judge whether products meet the provided specifications:
+       - Category: {category} {subcategory} {product_type} 
+       - Product type: {specification_name}
+       - Product specifications:
+{tech_spec}
+    3. Verify the product is currently available for purchase
+    4. Gather accurate pricing in EUR
+    5. Evaluate technical specification requirements one by one
+    6. Calculate and include price per unit for each product
+    """
+
+    # JSON format instructions
+    prompt += """
+    IMPORTANT: Your response MUST be formatted EXACTLY as a valid JSON array of product objects.
+    Each product in the array should have the following fields:
+
+    [
+      {
+        "provider": "Company selling the product",
+        "provider_website": "Main website domain (e.g., telia.lt)",
+        "provider_url": "Full URL to the specific product page",
+        "product_name": "Complete product name with model",
+        "product_properties": "Detailed product specifications as text",
+        "product_sku": "Any product identifiers (SKU, UPC, model number)",
+        "product_price": "Price in EUR with currency symbol",
+        "price_per_": "Price per unit if applicable",
+        "evaluation": "Detailed assessment of how the product meets or fails each technical specification"
+      }
+    ]
+
+    DO NOT include any explanation, preamble, or additional text - ONLY provide the JSON array.
+    """
+    return prompt
+
+
+def analyze_product_url(url, search_parameters, openai_api_key, firecrawl_api_key, is_aggregator_page=False):
+    """Analyze a product page URL to extract price information using improved scraping and analysis."""
+    client = OpenAI(api_key=openai_api_key)
+    app = FirecrawlApp(api_key=firecrawl_api_key)
+
+    category = search_parameters.get("grupe", "")
+    subcategory = search_parameters.get("modulis", "")
+    product_type = search_parameters.get("dalis", "")
+    specification_name = search_parameters.get("specification_name", "")
+
+    # Format the tech_spec from specification_parameters
+    tech_spec = ""
+    for param in search_parameters.get("specification_parameters", []):
+        tech_spec += f"- {param.get('parametras', '')}: {param.get('reikalavimas parametrui', '')}\n"
+
+    try:
+        # Scrape the website using FireCrawl
+        scrape_result = app.scrape_url(url, formats=['markdown'])
+
+        if not scrape_result or 'markdown' not in scrape_result:
+            st.error(f"Failed to scrape URL: {url}")
+            return None
+
+        content = scrape_result['markdown']
+        product_list = []
+
+        if is_aggregator_page:
+            st.info(f"🔗 Processing as aggregator page: {url}")
+            # Get individual product URLs from the aggregator
+            urls_list = get_urls(client, category, subcategory, product_type, specification_name, content)
+
+            if not urls_list:
+                st.warning(f"No relevant product URLs found on aggregator page: {url}")
+                return []
+
+            st.info(f"Found {len(urls_list)} product URLs to analyze")
+
+            # Analyze each individual product URL
+            for i, url_data in enumerate(urls_list):
+                product_url = url_data.get("product_url", "")
+                if not product_url:
+                    continue
+
+                try:
+                    st.info(f"Analyzing product {i + 1}/{len(urls_list)}: {product_url}")
+
+                    # Scrape individual product page
+                    product_scrape_result = app.scrape_url(product_url, formats=['markdown'])
+
+                    if product_scrape_result and 'markdown' in product_scrape_result:
+                        product_content = product_scrape_result['markdown']
+
+                        # Generate analysis prompt
+                        prompt = get_prompt(category, subcategory, product_type, specification_name, tech_spec,
+                                            product_content)
+
+                        # Analyze the product page
+                        response = client.responses.parse(
+                            model="gpt-4o",
+                            input=prompt,
+                            text_format=ProductList,
+                        )
+
+                        # Add products to the list
+                        if response.output_parsed.products:
+                            for product in response.output_parsed.products:
+                                product_list.append(product.model_dump())
+
+                except Exception as e:
+                    st.warning(f"Error analyzing product URL {product_url}: {str(e)}")
+                    continue
+        else:
+            st.info(f"🛍️ Processing as direct product page: {url}")
+            # Direct product page analysis
+            prompt = get_prompt(category, subcategory, product_type, specification_name, tech_spec, content)
+
+            response = client.responses.parse(
+                model="gpt-4o",
+                input=prompt,
+                text_format=ProductList,
+            )
+
+            # Convert to list of dictionaries
+            for product in response.output_parsed.products:
+                product_list.append(product.model_dump())
+
+        return product_list
+
+    except Exception as e:
+        st.error(f"Error analyzing product URL {url}: {str(e)}")
+        return None
 
 
 def generate_search_phrase(grupe, modulis, dalis, specifikacija, spec_params, openai_api_key):
@@ -206,85 +382,6 @@ Always include the word "kaina" in the search phrase.
         return None
 
 
-def analyze_product_url(url, search_parameters, openai_api_key):
-    """Analyze a product page URL to extract price information using OpenAI."""
-    client = OpenAI(api_key=openai_api_key)
-
-    category = search_parameters.get("grupe", "")
-    subcategory = search_parameters.get("modulis", "")
-    product_type = search_parameters.get("dalis", "")
-    specification_name = search_parameters.get("specification_name", "")
-
-    # Format the tech_spec from specification_parameters
-    tech_spec = ""
-    for param in search_parameters.get("specification_parameters", []):
-        tech_spec += f"- {param.get('parametras', '')}: {param.get('reikalavimas parametrui', '')}\n"
-
-    # Construct the prompt with the formatted parameters
-    prompt = f"""
-        Analyze the given webpage URL={url} for {category} {subcategory} {product_type} and gather detailed product information according to the following:
-                     product type: {specification_name}
-                     product specification:
-    {tech_spec}
-
-        2. Verify the product is currently available for purchase
-        3. Gather accurate pricing in EUR
-        4. Evaluate technical specification requirements one by one
-        5. Go to every product page listed in given URL webpage and retrieve price information
-
-        Calculate and include price per unit for each product
-        """
-
-    # JSON format instructions
-    prompt += """
-        IMPORTANT: Your response MUST be formatted EXACTLY as a valid JSON array of product objects.
-        Each product in the array should have the following fields:
-
-        [
-          {
-            "provider": "Company selling the product",
-            "provider_website": "Main website domain (e.g., telia.lt)",
-            "provider_url": "Full URL to the specific product page",
-            "product_name": "Complete product name with model",
-            "product_properties": {
-              "key_spec1": "value1",
-              "key_spec2": "value2"
-            },
-            "product_sku": "Any product identifiers (SKU, UPC, model number)",
-            "product_price": 299.99,
-            }]
-
-        DO NOT USE YOUR cache. ALWAYS SEARCH GIVEN WEB URL. IF CACHE IS OLDER THEN 2025-05-20, GO TO URL DIRECTLY.
-        """
-
-    try:
-        response = client.responses.parse(
-            model="gpt-4.1",
-            tools=[{
-                "type": "web_search_preview",
-                "user_location": {
-                    "type": "approximate",
-                    "country": "LT",
-                    "city": "Vilnius",
-                }
-            }],
-            temperature=0.2,
-            input=prompt,
-            text_format=ProductList,
-        )
-
-        # Process the response exactly as in the working example
-        products_json = []
-        for product in response.output_parsed.products:
-            products_json.append(product.model_dump())
-
-        return products_json
-
-    except Exception as e:
-        st.error(f"Error analyzing product URL: {e}")
-        return None
-
-
 def retrieve_search_results(query, required_domains=None, excluded_domains=None, google_api_key=None,
                             google_cse_id=None, num_results=10):
     """
@@ -374,6 +471,8 @@ def main():
         missing_keys.append("google_cse_id")
     if not st.secrets.get("config", {}).get("openai_api_key"):
         missing_keys.append("openai_api_key")
+    if not st.secrets.get("config", {}).get("firecrawl_api_key"):
+        missing_keys.append("firecrawl_api_key")
 
     # Only check for MySQL if not in demo mode
     if not demo_mode:
@@ -390,6 +489,7 @@ def main():
         google_api_key = "YOUR_GOOGLE_API_KEY"
         google_cse_id = "YOUR_CUSTOM_SEARCH_ENGINE_ID"
         openai_api_key = "YOUR_OPENAI_API_KEY"
+        firecrawl_api_key = "YOUR_FIRECRAWL_API_KEY"
 
         [mysql]
         host = "YOUR_MYSQL_HOST"
@@ -401,6 +501,12 @@ def main():
 
         with st.expander("How to set up required APIs"):
             st.markdown("""
+            ### FireCrawl API Setup
+            1. Go to [FireCrawl](https://firecrawl.dev/)
+            2. Create an account or log in
+            3. Navigate to API Keys section
+            4. Create a new API key
+
             ### MySQL Database Setup
             Configure your MySQL database with the schema that includes the required tables.
 
@@ -427,6 +533,7 @@ def main():
     google_api_key = st.secrets["config"]["google_api_key"]
     google_cse_id = st.secrets["config"]["google_cse_id"]
     openai_api_key = st.secrets["config"]["openai_api_key"]
+    firecrawl_api_key = st.secrets["config"]["firecrawl_api_key"]
 
     # Tab layout for different search modes
     tab1, tab2, tab3 = st.tabs(["Specification-Based Search", "Direct Keyword Search", "Search History"])
@@ -520,125 +627,136 @@ def main():
         # Domain configuration section
         st.subheader("Search Domain Configuration")
 
-        # Required Domains section
-        with st.expander("Required Domains", expanded=True):
-            st.markdown("These domains will be included in the search (but search won't be limited to only these)")
+        # Enable domain restrictions checkbox
+        enable_domain_restrictions = st.checkbox(
+            "🔒 Enable Domain Restrictions",
+            value=False,
+            help="Check this to restrict search to specific domains and exclude others"
+        )
 
-            # Initialize required domains in session state if not present
-            if "required_domains" not in st.session_state:
-                st.session_state.required_domains = []
+        if enable_domain_restrictions:
+            # Required Domains section
+            with st.expander("Required Domains", expanded=True):
+                st.markdown("These domains will be prioritized in the search results")
 
-            # Input for adding new required domain
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                new_required_domain = st.text_input(
-                    "Add required domain (e.g., example.lt):",
-                    placeholder="Enter a domain name without http:// or www.",
-                    key="new_required_domain"
-                )
-            with col2:
-                if st.button("Add Required") and new_required_domain:
-                    # Clean up domain (remove http://, www., trailing slashes)
-                    clean_domain = new_required_domain.lower().strip()
-                    clean_domain = clean_domain.replace("http://", "").replace("https://", "").replace("www.", "")
-                    clean_domain = clean_domain.split("/")[0]  # Remove any path
+                # Initialize required domains in session state if not present
+                if "required_domains" not in st.session_state:
+                    st.session_state.required_domains = []
 
-                    if clean_domain not in st.session_state.required_domains:
-                        st.session_state.required_domains.append(clean_domain)
-                        st.success(f"Added {clean_domain} to required domains")
-                    else:
-                        st.info(f"{clean_domain} is already in required domains")
+                # Input for adding new required domain
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    new_required_domain = st.text_input(
+                        "Add required domain (e.g., example.lt):",
+                        placeholder="Enter a domain name without http:// or www.",
+                        key="new_required_domain"
+                    )
+                with col2:
+                    if st.button("Add Required") and new_required_domain:
+                        # Clean up domain (remove http://, www., trailing slashes)
+                        clean_domain = new_required_domain.lower().strip()
+                        clean_domain = clean_domain.replace("http://", "").replace("https://", "").replace("www.", "")
+                        clean_domain = clean_domain.split("/")[0]  # Remove any path
 
-            # Display current required domains
-            if st.session_state.required_domains:
-                st.write("Current required domains:")
-                domains_to_remove = []
+                        if clean_domain not in st.session_state.required_domains:
+                            st.session_state.required_domains.append(clean_domain)
+                            st.success(f"Added {clean_domain} to required domains")
+                        else:
+                            st.info(f"{clean_domain} is already in required domains")
 
-                # Ensure we have unique domains before creating checkboxes
-                unique_domains = list(dict.fromkeys(st.session_state.required_domains))
+                # Display current required domains
+                if st.session_state.required_domains:
+                    st.write("Current required domains:")
+                    domains_to_remove = []
 
-                # Update session state to contain only unique domains
-                st.session_state.required_domains = unique_domains
+                    # Ensure we have unique domains before creating checkboxes
+                    unique_domains = list(dict.fromkeys(st.session_state.required_domains))
 
-                # Create columns for domain display
-                cols = st.columns(3)
-                for i, domain in enumerate(unique_domains):
-                    col_idx = i % 3
-                    with cols[col_idx]:
-                        # Generate a truly unique key for each checkbox
-                        unique_key = f"required_domain_{domain}_{i}_{id(domain)}"
-                        if not st.checkbox(domain, value=True, key=unique_key):
-                            domains_to_remove.append(domain)
+                    # Update session state to contain only unique domains
+                    st.session_state.required_domains = unique_domains
 
-                # Remove unchecked domains
-                for domain in domains_to_remove:
-                    st.session_state.required_domains.remove(domain)
-            else:
-                st.info("No required domains added. Search will include all Lithuanian (.lt) domains by default.")
+                    # Create columns for domain display
+                    cols = st.columns(3)
+                    for i, domain in enumerate(unique_domains):
+                        col_idx = i % 3
+                        with cols[col_idx]:
+                            # Generate a truly unique key for each checkbox
+                            unique_key = f"required_domain_{domain}_{i}_{id(domain)}"
+                            if not st.checkbox(domain, value=True, key=unique_key):
+                                domains_to_remove.append(domain)
 
-        # Excluded Domains section
-        with st.expander("Excluded Domains", expanded=True):
-            st.markdown("These domains will be excluded from the search")
+                    # Remove unchecked domains
+                    for domain in domains_to_remove:
+                        st.session_state.required_domains.remove(domain)
+                else:
+                    st.info("No required domains added.")
 
-            # Initialize excluded domains in session state if not present
-            if "excluded_domains" not in st.session_state:
-                # Set default excluded domains
-                st.session_state.excluded_domains = [
-                    "klaipeda.diena.lt", "reidasofficial.lt", "delfi.lt", "15min.lt", "lrytas.lt", "lrt.lt", "vz.lt", "ve.lt",
-                    "valstietis.lt", "aidas.lt", "bernardinai.lt", "kurier.lt",
-                    "technologijos.lt", "startuplithuania.com", "investlithuania.com",
-                    "b2lithuania.com", "ktu.lt", "dainavoszodis.lt", "jonavosnaujienos.lt",
-                    "gyvenimas.eu", "gargzdai.lt", "baltictimes.com", "debesyla.lt",
-                    "dziaugiuosisavimi.lt", "ieskantysmenulio.lt", "domreg.lt", "rrt.lt",
-                    "boreapanda.lt", "lithuania.travel"
-                ]
+            # Excluded Domains section
+            with st.expander("Excluded Domains", expanded=True):
+                st.markdown("These domains will be excluded from the search")
 
-            # Input for adding new excluded domain
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                new_excluded_domain = st.text_input(
-                    "Add excluded domain (e.g., example.lt):",
-                    placeholder="Enter a domain name without http:// or www.",
-                    key="new_excluded_domain"
-                )
-            with col2:
-                if st.button("Add Excluded") and new_excluded_domain:
-                    # Clean up domain (remove http://, www., trailing slashes)
-                    clean_domain = new_excluded_domain.lower().strip()
-                    clean_domain = clean_domain.replace("http://", "").replace("https://", "").replace("www.", "")
-                    clean_domain = clean_domain.split("/")[0]  # Remove any path
+                # Initialize excluded domains in session state if not present
+                if "excluded_domains" not in st.session_state:
+                    # Set default excluded domains
+                    st.session_state.excluded_domains = [
+                        "ic24.lt", "skrastas.lt","kauno.diena.lt","klaipeda.diena.lt", "reidasofficial.lt", "delfi.lt", "15min.lt", "lrytas.lt", "lrt.lt",
+                        "vz.lt", "ve.lt",
+                        "valstietis.lt", "aidas.lt", "bernardinai.lt", "kurier.lt",
+                        "technologijos.lt", "startuplithuania.com", "investlithuania.com",
+                        "b2lithuania.com", "ktu.lt", "dainavoszodis.lt", "jonavosnaujienos.lt",
+                        "gyvenimas.eu", "gargzdai.lt", "baltictimes.com", "debesyla.lt",
+                        "dziaugiuosisavimi.lt", "ieskantysmenulio.lt", "domreg.lt", "rrt.lt",
+                        "boreapanda.lt", "lithuania.travel"
+                    ]
 
-                    if clean_domain not in st.session_state.excluded_domains:
-                        st.session_state.excluded_domains.append(clean_domain)
-                        st.success(f"Added {clean_domain} to excluded domains")
-                    else:
-                        st.info(f"{clean_domain} is already in excluded domains")
+                # Input for adding new excluded domain
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    new_excluded_domain = st.text_input(
+                        "Add excluded domain (e.g., example.lt):",
+                        placeholder="Enter a domain name without http:// or www.",
+                        key="new_excluded_domain"
+                    )
+                with col2:
+                    if st.button("Add Excluded") and new_excluded_domain:
+                        # Clean up domain (remove http://, www., trailing slashes)
+                        clean_domain = new_excluded_domain.lower().strip()
+                        clean_domain = clean_domain.replace("http://", "").replace("https://", "").replace("www.", "")
+                        clean_domain = clean_domain.split("/")[0]  # Remove any path
 
-            # Display current excluded domains
-            if st.session_state.excluded_domains:
-                st.write("Current excluded domains:")
-                domains_to_keep = []
+                        if clean_domain not in st.session_state.excluded_domains:
+                            st.session_state.excluded_domains.append(clean_domain)
+                            st.success(f"Added {clean_domain} to excluded domains")
+                        else:
+                            st.info(f"{clean_domain} is already in excluded domains")
 
-                # Ensure we have unique domains before creating checkboxes
-                unique_domains = list(dict.fromkeys(st.session_state.excluded_domains))
+                # Display current excluded domains
+                if st.session_state.excluded_domains:
+                    st.write("Current excluded domains:")
+                    domains_to_keep = []
 
-                # Update session state to contain only unique domains
-                st.session_state.excluded_domains = unique_domains
+                    # Ensure we have unique domains before creating checkboxes
+                    unique_domains = list(dict.fromkeys(st.session_state.excluded_domains))
 
-                # Create columns for domain display
-                cols = st.columns(3)
-                for i, domain in enumerate(unique_domains):
-                    col_idx = i % 3
-                    with cols[col_idx]:
-                        # Generate a truly unique key for each checkbox
-                        unique_key = f"excluded_domain_{domain}_{i}_{id(domain)}"
-                        if st.checkbox(domain, value=True, key=unique_key):
-                            domains_to_keep.append(domain)
+                    # Update session state to contain only unique domains
+                    st.session_state.excluded_domains = unique_domains
 
-                # Keep only checked domains
-                st.session_state.excluded_domains = domains_to_keep
-            else:
-                st.info("No domains are currently excluded from search results.")
+                    # Create columns for domain display
+                    cols = st.columns(3)
+                    for i, domain in enumerate(unique_domains):
+                        col_idx = i % 3
+                        with cols[col_idx]:
+                            # Generate a truly unique key for each checkbox
+                            unique_key = f"excluded_domain_{domain}_{i}_{id(domain)}"
+                            if st.checkbox(domain, value=True, key=unique_key):
+                                domains_to_keep.append(domain)
+
+                    # Keep only checked domains
+                    st.session_state.excluded_domains = domains_to_keep
+                else:
+                    st.info("No domains are currently excluded from search results.")
+        else:
+            st.info("🌐 Domain restrictions disabled - searching all Lithuanian (.lt) domains")
 
         # Initialize session state variables if they don't exist
         if "search_phrase_generated" not in st.session_state:
@@ -732,10 +850,17 @@ def main():
                     if st.button("Search Products", type="primary"):
                         with st.spinner("Searching for products..."):
                             # Use edited phrase for search
+                            required_domains = None
+                            excluded_domains = None
+
+                            if enable_domain_restrictions:
+                                required_domains = st.session_state.required_domains if st.session_state.required_domains else None
+                                excluded_domains = st.session_state.excluded_domains if "excluded_domains" in st.session_state else None
+
                             search_results = retrieve_search_results(
                                 st.session_state.edited_search_phrase,
-                                st.session_state.required_domains if st.session_state.required_domains else None,
-                                st.session_state.excluded_domains if "excluded_domains" in st.session_state else None,
+                                required_domains,
+                                excluded_domains,
                                 google_api_key,
                                 google_cse_id,
                                 st.session_state.num_results
@@ -762,7 +887,7 @@ def main():
                                 "specification_name": st.session_state.selected_spec,
                                 "specification_parameters": st.session_state.spec_params
                             }
-                            st.write(search_parameters)
+
                             # Display search parameters
                             with st.expander("Search Parameters", expanded=True):
                                 st.write(f"**Group:** {st.session_state.selected_grupe}")
@@ -784,7 +909,7 @@ def main():
 
                             # Display results
                             display_search_results(search_results, search_parameters,
-                                                   openai_api_key)
+                                                   openai_api_key, firecrawl_api_key)
 
     with tab2:
         st.header("Direct Keyword Search")
@@ -874,7 +999,8 @@ def main():
                     st.session_state.search_history.append(history_entry)
 
                     # Display results
-                    display_search_results(search_results, search_query, openai_api_key if analyze_prices else None)
+                    display_search_results(search_results, search_query, openai_api_key if analyze_prices else None,
+                                           firecrawl_api_key if analyze_prices else None)
 
     with tab3:
         st.header("Search History")
@@ -894,111 +1020,161 @@ def main():
                         st.divider()
 
 
-def display_search_results(search_results, search_parameters, openai_api_key=None):
+def display_search_results(search_results, search_parameters, openai_api_key=None, firecrawl_api_key=None):
     """Display search results with optional price analysis."""
     st.subheader("Search Results")
 
     if search_results.get('results'):
-        # Initialize progress tracking for price analysis
-        price_analyses = {}
-        if openai_api_key:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            st.info("Analyzing prices for each product... This may take a minute.")
+        # First, display all search results and let user select which ones to analyze
+        st.write("### 📋 Search Results Overview")
+        st.write(f"Found {len(search_results['results'])} results. Select which ones you want to analyze for prices:")
 
+        # Initialize selected results in session state
+        if "selected_results" not in st.session_state:
+            st.session_state.selected_results = []
+
+        # Display results with selection checkboxes
+        selected_results = []
         for i, result in enumerate(search_results['results']):
-            with st.expander(f"{i + 1}. {result['title']}"):
-                col1, col2 = st.columns([2, 1])
+            col1, col2 = st.columns([1, 4])
 
+            with col1:
+                is_selected = st.checkbox(
+                    f"Select {i + 1}",
+                    key=f"select_result_{i}",
+                    help="Check to include this result in price analysis"
+                )
+                if is_selected:
+                    selected_results.append((i, result))
+
+            with col2:
+                st.write(f"**{i + 1}. [{result['title']}]({result['url']})**")
+                st.write(f"**Domain:** {result['domain']}")
+                st.write(f"**URL:** {result['url']}")
+                st.write(f"**Description:** {result['snippet']}")
+                st.divider()
+
+        # Store selected results in session state
+        st.session_state.selected_results = selected_results
+
+        # Show analysis section only if there are selected results and API keys are available
+        if selected_results and openai_api_key and firecrawl_api_key:
+            st.write("### 🔍 Price Analysis")
+            st.write(f"You have selected {len(selected_results)} results for analysis.")
+
+            # Add aggregator selection checkboxes
+            st.write("**Configure Analysis Settings:**")
+            aggregator_settings = {}
+
+            for i, (result_idx, result) in enumerate(selected_results):
+                col1, col2 = st.columns([1, 3])
                 with col1:
-                    st.write(f"**URL:** [{result['url']}]({result['url']})")
-                    st.write(f"**Domain:** {result['domain']}")
-                    st.write(f"**Description:** {result['snippet']}")
+                    is_aggregator = st.checkbox(
+                        f"Aggregator",
+                        key=f"aggregator_{result_idx}",
+                        help="Check if this page is a price comparison/aggregator site"
+                    )
+                    aggregator_settings[result_idx] = is_aggregator
+                with col2:
+                    st.write(f"**{result['title']}** - {result['domain']}")
 
-                # If OpenAI API key is provided, analyze product price
-                if openai_api_key:
-                    with col2:
-                        # Update progress status
-                        progress_value = (i + 1) / len(search_results['results'])
-                        progress_bar.progress(progress_value)
-                        status_text.text(f"Analyzing product {i + 1}/{len(search_results['results'])}")
+            # Analysis button
+            if st.button("🚀 Start Price Analysis", type="primary"):
+                # Initialize progress tracking for price analysis
+                price_analyses = {}
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                st.info("🔍 Analyzing prices for selected products... This may take a few minutes.")
 
-                        # Check if we've already analyzed this URL
-                        if result['url'] not in price_analyses:
-                            try:
-                                with st.spinner(f"Analyzing price for product {i + 1}..."):
-                                    st.write(result['url'])
-                                    price_analysis = analyze_product_url(result['url'], search_parameters,
-                                                                         openai_api_key)
-                                    if price_analysis:
-                                        price_analyses[result['url']] = price_analysis
-                            except Exception as e:
-                                st.error(f"Error analyzing product: {str(e)}")
+                for i, (result_idx, result) in enumerate(selected_results):
+                    # Update progress status
+                    progress_value = (i + 1) / len(selected_results)
+                    progress_bar.progress(progress_value)
+                    status_text.text(f"🔍 Analyzing result {i + 1}/{len(selected_results)}")
 
-                        # Display price analysis if available
-                        if result['url'] in price_analyses:
-                            analysis_list = price_analyses[result['url']]
-                            if analysis_list and len(analysis_list) > 0:  # Check if the list is not empty
-                                # Take the first product from the list
-                                analysis = analysis_list[0]
-                                st.write("### Price Analysis")
-                                st.write(f"**Product:** {analysis['product_name']}")
+                    try:
+                        with st.spinner(f"Analyzing {result['title']}..."):
+                            is_aggregator = aggregator_settings.get(result_idx, False)
+                            price_analysis = analyze_product_url(
+                                result['url'],
+                                search_parameters,
+                                openai_api_key,
+                                firecrawl_api_key,
+                                is_aggregator_page=is_aggregator
+                            )
+                            if price_analysis:
+                                price_analyses[result['url']] = price_analysis
+                    except Exception as e:
+                        st.error(f"Error analyzing {result['title']}: {str(e)}")
 
-                                # Price information
-                                if 'product_price' in analysis:
-                                    st.write(f"**Price:** {analysis['product_price']}")
-                                if 'price_per_' in analysis and analysis['price_per_']:
-                                    st.write(f"**Price per:** {analysis['price_per_']}")
+                # Clear progress indicators
+                progress_bar.empty()
+                status_text.empty()
+                st.success("✅ Price analysis completed!")
 
-                                # Display product properties
-                                if 'product_properties' in analysis and analysis['product_properties']:
-                                    st.write("**Properties:**")
-                                    st.text(analysis['product_properties'])
-
-                                # Display evaluation/judgment
-                                if 'evaluation' in analysis:
-                                    st.markdown(f"**Evaluation:** {analysis['evaluation']}")
-
-                                # Display provider information
-                                if 'provider' in analysis:
-                                    st.write(f"**Provider:** {analysis['provider']} ({analysis['provider_website']})")
-
-                                # Display more products if available
-                                if len(analysis_list) > 1:
-                                    show_more = st.checkbox(f"View {len(analysis_list) - 1} more similar products",
-                                                            key=f"more_products_{i}")
-                                    if show_more:
-                                        for j, product in enumerate(analysis_list[1:], 1):
-                                            st.write(f"**Alternative {j}: {product.get('product_name', 'N/A')}**")
-                                            st.write(f"**Price:** {product.get('product_price', 'N/A')}")
-                                            if 'product_properties' in product and product['product_properties']:
-                                                st.write("**Properties:**")
-                                                st.text(product['product_properties'])
-                                            if 'evaluation' in product:
-                                                st.write(f"**Evaluation:** {product['evaluation']}")
-                                            st.write(
-                                                f"**Provider:** {product.get('provider', 'N/A')} ({product.get('provider_website', 'N/A')})")
-                                            st.divider()
-
-        # Clear progress indicators once done
-        if openai_api_key:
-            progress_bar.empty()
-            status_text.empty()
-            st.success("Price analysis completed!")
-
-        # Export option
-        if st.button("Export Results as JSON"):
-            # Include price analyses in export if available
-            if openai_api_key and price_analyses:
-                export_data = []
-                for result in search_results['results']:
-                    result_data = result.copy()
+                # Display analysis results
+                st.write("### 💰 Analysis Results")
+                for result_idx, result in selected_results:
                     if result['url'] in price_analyses:
-                        result_data['price_analysis'] = price_analyses[result['url']]
-                    export_data.append(result_data)
-                st.json(export_data)
-            else:
-                st.json(search_results['results'])
+                        analysis_list = price_analyses[result['url']]
+
+                        with st.expander(f"📊 Analysis: {result['title']}", expanded=True):
+                            if analysis_list and len(analysis_list) > 0:
+                                # Display each product found
+                                for j, analysis in enumerate(analysis_list):
+                                    if j > 0:
+                                        st.divider()
+
+                                    col1, col2 = st.columns([2, 1])
+
+                                    with col1:
+                                        st.write(f"**Product {j + 1}:** {analysis['product_name']}")
+
+                                        # Price information
+                                        if 'product_price' in analysis:
+                                            st.write(f"**💰 Price:** {analysis['product_price']}")
+                                        if 'price_per_' in analysis and analysis['price_per_']:
+                                            st.write(f"**📏 Price per:** {analysis['price_per_']}")
+
+                                        # Display product properties
+                                        if 'product_properties' in analysis and analysis['product_properties']:
+                                            st.write("**📋 Properties:**")
+                                            st.text(analysis['product_properties'])
+
+                                        # Display evaluation/judgment
+                                        if 'evaluation' in analysis:
+                                            st.write("**✅ Evaluation:**")
+                                            st.markdown(analysis['evaluation'])
+
+                                    with col2:
+                                        # Display provider information
+                                        if 'provider' in analysis:
+                                            st.write(f"**🏪 Provider:** {analysis['provider']}")
+                                            if 'provider_website' in analysis:
+                                                st.write(f"**🌐 Website:** {analysis.get('provider_website', 'N/A')}")
+                                            if 'provider_url' in analysis:
+                                                st.write(
+                                                    f"**🔗 URL:** [{analysis.get('provider_url', 'N/A')}]({analysis.get('provider_url', '#')})")
+                            else:
+                                st.info("No products found matching the specifications on this page.")
+                    else:
+                        with st.expander(f"❌ Failed: {result['title']}", expanded=False):
+                            st.error("Analysis failed for this URL")
+
+                # Export option
+                if st.button("📥 Export Analysis Results as JSON"):
+                    export_data = []
+                    for result_idx, result in selected_results:
+                        result_data = result.copy()
+                        if result['url'] in price_analyses:
+                            result_data['price_analysis'] = price_analyses[result['url']]
+                        export_data.append(result_data)
+                    st.json(export_data)
+
+        elif selected_results and (not openai_api_key or not firecrawl_api_key):
+            st.warning("⚠️ Price analysis requires both OpenAI and FireCrawl API keys to be configured.")
+        elif not selected_results:
+            st.info("ℹ️ Select some results above to enable price analysis.")
     else:
         st.warning("No results found. Try modifying your search terms.")
 

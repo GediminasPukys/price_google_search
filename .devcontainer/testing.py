@@ -292,3 +292,5 @@ print(scrape_result)
 prompt = f"""given context is crawled web page. I need to know does this page contains product list with technical specification or is it just product price aggregator?
 context: {scrape_result}
 """
+
+

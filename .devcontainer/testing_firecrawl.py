@@ -91,7 +91,11 @@ url = 'https://www.kainos.lt/paieska/xiaomi-redmi-note-14-pro-5g-256gb-kaina'
 app = FirecrawlApp(api_key=fc_ai_api_key)
 
 # Scrape a website:
+
+url='https://www.saurida.lt/kuro-kainos-degalinese/'
 scrape_result = app.scrape_url(url, formats=['markdown'])
+
+
 print(scrape_result)
 
 
@@ -173,5 +177,7 @@ def get_prices_from_url(url, category, subcategory, product_type, specification_
     )
 
     return response.output_parsed.products
+
+
 
 
