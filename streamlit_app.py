@@ -230,6 +230,7 @@ def analyze_product_url(url, search_parameters, openai_api_key):
         2. Verify the product is currently available for purchase
         3. Gather accurate pricing in EUR
         4. Evaluate technical specification requirements one by one
+        5. Go to every product page listed in given URL webpage and retrieve price information
 
         Calculate and include price per unit for each product
         """
@@ -251,19 +252,22 @@ def analyze_product_url(url, search_parameters, openai_api_key):
             },
             "product_sku": "Any product identifiers (SKU, UPC, model number)",
             "product_price": 299.99,
+            }]
+
+        DO NOT USE YOUR cache. ALWAYS SEARCH GIVEN WEB URL. IF CACHE IS OLDER THEN 2025-05-20, GO TO URL DIRECTLY.
         """
 
     try:
         response = client.responses.parse(
             model="gpt-4.1",
-            # tools=[{
-            #     "type": "web_search_preview",
-            #     "user_location": {
-            #         "type": "approximate",
-            #         "country": "LT",
-            #         "city": "Vilnius",
-            #     }
-            # }],
+            tools=[{
+                "type": "web_search_preview",
+                "user_location": {
+                    "type": "approximate",
+                    "country": "LT",
+                    "city": "Vilnius",
+                }
+            }],
             temperature=0.2,
             input=prompt,
             text_format=ProductList,
@@ -281,13 +285,15 @@ def analyze_product_url(url, search_parameters, openai_api_key):
         return None
 
 
-def retrieve_search_results(query, required_domains=None, google_api_key=None, google_cse_id=None, num_results=10):
+def retrieve_search_results(query, required_domains=None, excluded_domains=None, google_api_key=None,
+                            google_cse_id=None, num_results=10):
     """
     Retrieve search results using Google Custom Search API with Lithuanian domain filtering and PDF exclusion.
 
     Args:
         query (str): Search query
         required_domains (list): List of domains that must be included in the search
+        excluded_domains (list): List of domains that must be excluded from the search
         google_api_key (str): Google API key
         google_cse_id (str): Google Custom Search Engine ID
         num_results (int): Number of results to retrieve
@@ -302,9 +308,11 @@ def retrieve_search_results(query, required_domains=None, google_api_key=None, g
         # Add Lithuanian domain and PDF exclusion to the query
         modified_query = f"{query} site:.lt -filetype:pdf"
 
-        # Handle required domains if specified - but keep the query simpler
-        # Instead of trying to combine with OR operators, we'll just run the search
-        # with the Lithuanian filter and then prioritize results from required domains
+        # Exclude domains if specified
+        if excluded_domains and len(excluded_domains) > 0:
+            # Add exclusions to the query
+            for domain in excluded_domains:
+                modified_query += f" -site:{domain}"
 
         st.info(f"Search query: {modified_query}")
 
@@ -512,60 +520,125 @@ def main():
         # Domain configuration section
         st.subheader("Search Domain Configuration")
 
-        # Let users add required domains
-        st.markdown("#### Required Domains")
-        st.markdown("These domains will be included in the search (but search won't be limited to only these)")
+        # Required Domains section
+        with st.expander("Required Domains", expanded=True):
+            st.markdown("These domains will be included in the search (but search won't be limited to only these)")
 
-        # Initialize required domains in session state if not present
-        if "required_domains" not in st.session_state:
-            st.session_state.required_domains = []
+            # Initialize required domains in session state if not present
+            if "required_domains" not in st.session_state:
+                st.session_state.required_domains = []
 
-        # Input for adding new required domain
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            new_required_domain = st.text_input(
-                "Add required domain (e.g., example.lt):",
-                placeholder="Enter a domain name without http:// or www."
-            )
-        with col2:
-            if st.button("Add Domain") and new_required_domain:
-                # Clean up domain (remove http://, www., trailing slashes)
-                clean_domain = new_required_domain.lower().strip()
-                clean_domain = clean_domain.replace("http://", "").replace("https://", "").replace("www.", "")
-                clean_domain = clean_domain.split("/")[0]  # Remove any path
+            # Input for adding new required domain
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                new_required_domain = st.text_input(
+                    "Add required domain (e.g., example.lt):",
+                    placeholder="Enter a domain name without http:// or www.",
+                    key="new_required_domain"
+                )
+            with col2:
+                if st.button("Add Required") and new_required_domain:
+                    # Clean up domain (remove http://, www., trailing slashes)
+                    clean_domain = new_required_domain.lower().strip()
+                    clean_domain = clean_domain.replace("http://", "").replace("https://", "").replace("www.", "")
+                    clean_domain = clean_domain.split("/")[0]  # Remove any path
 
-                if clean_domain not in st.session_state.required_domains:
-                    st.session_state.required_domains.append(clean_domain)
-                    st.success(f"Added {clean_domain} to required domains")
-                else:
-                    st.info(f"{clean_domain} is already in required domains")
+                    if clean_domain not in st.session_state.required_domains:
+                        st.session_state.required_domains.append(clean_domain)
+                        st.success(f"Added {clean_domain} to required domains")
+                    else:
+                        st.info(f"{clean_domain} is already in required domains")
 
-        # Display current required domains
-        if st.session_state.required_domains:
-            st.write("Current required domains:")
-            domains_to_remove = []
+            # Display current required domains
+            if st.session_state.required_domains:
+                st.write("Current required domains:")
+                domains_to_remove = []
 
-            # Ensure we have unique domains before creating checkboxes
-            unique_domains = list(dict.fromkeys(st.session_state.required_domains))
+                # Ensure we have unique domains before creating checkboxes
+                unique_domains = list(dict.fromkeys(st.session_state.required_domains))
 
-            # Update session state to contain only unique domains
-            st.session_state.required_domains = unique_domains
+                # Update session state to contain only unique domains
+                st.session_state.required_domains = unique_domains
 
-            # Create columns for domain display
-            cols = st.columns(3)
-            for i, domain in enumerate(unique_domains):
-                col_idx = i % 3
-                with cols[col_idx]:
-                    # Generate a truly unique key for each checkbox
-                    unique_key = f"required_domain_{domain}_{i}_{id(domain)}"
-                    if not st.checkbox(domain, value=True, key=unique_key):
-                        domains_to_remove.append(domain)
+                # Create columns for domain display
+                cols = st.columns(3)
+                for i, domain in enumerate(unique_domains):
+                    col_idx = i % 3
+                    with cols[col_idx]:
+                        # Generate a truly unique key for each checkbox
+                        unique_key = f"required_domain_{domain}_{i}_{id(domain)}"
+                        if not st.checkbox(domain, value=True, key=unique_key):
+                            domains_to_remove.append(domain)
 
-            # Remove unchecked domains
-            for domain in domains_to_remove:
-                st.session_state.required_domains.remove(domain)
-        else:
-            st.info("No required domains added. Search will include all Lithuanian (.lt) domains by default.")
+                # Remove unchecked domains
+                for domain in domains_to_remove:
+                    st.session_state.required_domains.remove(domain)
+            else:
+                st.info("No required domains added. Search will include all Lithuanian (.lt) domains by default.")
+
+        # Excluded Domains section
+        with st.expander("Excluded Domains", expanded=True):
+            st.markdown("These domains will be excluded from the search")
+
+            # Initialize excluded domains in session state if not present
+            if "excluded_domains" not in st.session_state:
+                # Set default excluded domains
+                st.session_state.excluded_domains = [
+                    "klaipeda.diena.lt", "reidasofficial.lt", "delfi.lt", "15min.lt", "lrytas.lt", "lrt.lt", "vz.lt", "ve.lt",
+                    "valstietis.lt", "aidas.lt", "bernardinai.lt", "kurier.lt",
+                    "technologijos.lt", "startuplithuania.com", "investlithuania.com",
+                    "b2lithuania.com", "ktu.lt", "dainavoszodis.lt", "jonavosnaujienos.lt",
+                    "gyvenimas.eu", "gargzdai.lt", "baltictimes.com", "debesyla.lt",
+                    "dziaugiuosisavimi.lt", "ieskantysmenulio.lt", "domreg.lt", "rrt.lt",
+                    "boreapanda.lt", "lithuania.travel"
+                ]
+
+            # Input for adding new excluded domain
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                new_excluded_domain = st.text_input(
+                    "Add excluded domain (e.g., example.lt):",
+                    placeholder="Enter a domain name without http:// or www.",
+                    key="new_excluded_domain"
+                )
+            with col2:
+                if st.button("Add Excluded") and new_excluded_domain:
+                    # Clean up domain (remove http://, www., trailing slashes)
+                    clean_domain = new_excluded_domain.lower().strip()
+                    clean_domain = clean_domain.replace("http://", "").replace("https://", "").replace("www.", "")
+                    clean_domain = clean_domain.split("/")[0]  # Remove any path
+
+                    if clean_domain not in st.session_state.excluded_domains:
+                        st.session_state.excluded_domains.append(clean_domain)
+                        st.success(f"Added {clean_domain} to excluded domains")
+                    else:
+                        st.info(f"{clean_domain} is already in excluded domains")
+
+            # Display current excluded domains
+            if st.session_state.excluded_domains:
+                st.write("Current excluded domains:")
+                domains_to_keep = []
+
+                # Ensure we have unique domains before creating checkboxes
+                unique_domains = list(dict.fromkeys(st.session_state.excluded_domains))
+
+                # Update session state to contain only unique domains
+                st.session_state.excluded_domains = unique_domains
+
+                # Create columns for domain display
+                cols = st.columns(3)
+                for i, domain in enumerate(unique_domains):
+                    col_idx = i % 3
+                    with cols[col_idx]:
+                        # Generate a truly unique key for each checkbox
+                        unique_key = f"excluded_domain_{domain}_{i}_{id(domain)}"
+                        if st.checkbox(domain, value=True, key=unique_key):
+                            domains_to_keep.append(domain)
+
+                # Keep only checked domains
+                st.session_state.excluded_domains = domains_to_keep
+            else:
+                st.info("No domains are currently excluded from search results.")
 
         # Initialize session state variables if they don't exist
         if "search_phrase_generated" not in st.session_state:
@@ -662,6 +735,7 @@ def main():
                             search_results = retrieve_search_results(
                                 st.session_state.edited_search_phrase,
                                 st.session_state.required_domains if st.session_state.required_domains else None,
+                                st.session_state.excluded_domains if "excluded_domains" in st.session_state else None,
                                 google_api_key,
                                 google_cse_id,
                                 st.session_state.num_results
@@ -733,6 +807,13 @@ def main():
                 help="Enter domains that must be included in the search (one per line, without http:// or www.)"
             )
 
+            # Multi-line input for excluded domains
+            excluded_domains_input = st.text_area(
+                "Excluded Domains (one per line)",
+                value="delfi.lt\n15min.lt\nlrytas.lt\nlrt.lt",
+                help="Enter domains that should be excluded from the search (one per line, without http:// or www.)"
+            )
+
             num_results = st.slider("Number of results", 5, 30, 10)
 
             # Analyze prices with OpenAI option
@@ -755,10 +836,22 @@ def main():
                         domain = domain.split("/")[0]  # Remove any path
                         required_domains.append(domain)
 
+            # Process excluded domains
+            excluded_domains = []
+            if excluded_domains_input:
+                for line in excluded_domains_input.split('\n'):
+                    domain = line.strip().lower()
+                    if domain:
+                        # Clean up domain
+                        domain = domain.replace("http://", "").replace("https://", "").replace("www.", "")
+                        domain = domain.split("/")[0]  # Remove any path
+                        excluded_domains.append(domain)
+
             with st.spinner("Searching..."):
                 search_results = retrieve_search_results(
                     search_query,
                     required_domains if required_domains else None,
+                    excluded_domains if excluded_domains else None,
                     google_api_key,
                     google_cse_id,
                     num_results
@@ -908,6 +1001,7 @@ def display_search_results(search_results, search_parameters, openai_api_key=Non
                 st.json(search_results['results'])
     else:
         st.warning("No results found. Try modifying your search terms.")
+
 
 if __name__ == "__main__":
     main()
